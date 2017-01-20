@@ -233,6 +233,8 @@ class AmclNode
     ros::NodeHandle private_nh_;
     ros::Publisher pose_pub_;
     ros::Publisher particlecloud_pub_;
+    ros::Publisher probability_statistics_;
+    ros::Publisher probability_statistics_1_;//added for publishing weights
     ros::ServiceServer global_loc_srv_;
     ros::ServiceServer nomotion_update_srv_; //to let amcl update samples without requiring motion
     ros::ServiceServer set_map_srv_;
@@ -421,6 +423,8 @@ AmclNode::AmclNode() :
 
   pose_pub_ = nh_.advertise<geometry_msgs::PoseWithCovarianceStamped>("amcl_pose", 2, true);
   particlecloud_pub_ = nh_.advertise<geometry_msgs::PoseArray>("particlecloud", 2, true);
+  probability_statistics_ = nh_.advertise<geometry_msgs::Vector3>("weights_pub", 2, true); //Added for Publishing weights info
+  probability_statistics_1_ = nh_.advertise<geometry_msgs::Vector3>("diff_pub", 2, true); //Added for Publishing weights info
   global_loc_srv_ = nh_.advertiseService("global_localization", 
 					 &AmclNode::globalLocalizationCallback,
                                          this);
@@ -1038,6 +1042,7 @@ AmclNode::setMapCallback(nav_msgs::SetMap::Request& req,
 void
 AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
 {
+  float w_diff; //Edited for statistics
   last_laser_received_ts_ = ros::Time::now();
   if( map_ == NULL ) {
     return;
@@ -1059,7 +1064,7 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
     tf::Stamped<tf::Pose> laser_pose;
     try
     {
-      this->tf_->transformPose(base_frame_id_, ident, laser_pose);
+    this->tf_->transformPose(base_frame_id_, ident, laser_pose);
     }
     catch(tf::TransformException& e)
     {
@@ -1076,7 +1081,7 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
     // laser mounting angle gets computed later -> set to 0 here!
     laser_pose_v.v[2] = 0;
     lasers_[laser_index]->SetLaserPose(laser_pose_v);
-    ROS_DEBUG("Received laser's pose wrt robot: %.3f %.3f %.3f",
+    ROS_DEBUG("Received laser's pose wrt robot: %.3f %.3f %.3f", 
               laser_pose_v.v[0],
               laser_pose_v.v[1],
               laser_pose_v.v[2]);
@@ -1097,7 +1102,7 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
   }
 
 
-  pf_vector_t delta = pf_vector_zero();
+  pf_vector_t delta = pf_vector_zero(); 
 
   if(pf_init_)
   {
@@ -1106,6 +1111,8 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
     delta.v[0] = pose.v[0] - pf_odom_pose_.v[0];
     delta.v[1] = pose.v[1] - pf_odom_pose_.v[1];
     delta.v[2] = angle_diff(pose.v[2], pf_odom_pose_.v[2]);
+
+    
 
     // See if we should update the filter
     bool update = fabs(delta.v[0]) > d_thresh_ ||
@@ -1119,7 +1126,7 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
       for(unsigned int i=0; i < lasers_update_.size(); i++)
         lasers_update_[i] = true;
   }
-
+ 
   bool force_publication = false;
   if(!pf_init_)
   {
@@ -1140,7 +1147,7 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
   // If the robot has moved, update the filter
   else if(pf_init_ && lasers_update_[laser_index])
   {
-    //printf("pose\n");
+    //printf("pose\n"); 
     //pf_vector_fprintf(pose, stdout, "%.3f");
 
     AMCLOdomData odata;
@@ -1162,12 +1169,11 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
   if(lasers_update_[laser_index])
   {
     AMCLLaserData ldata;
-    ldata.sensor = lasers_[laser_index];
+    ldata.sensor = lasers_[laser_index]; 
     ldata.range_count = laser_scan->ranges.size();
 
     // To account for lasers that are mounted upside-down, we determine the
     // min, max, and increment angles of the laser in the base frame.
-    //
     // Construct min and max angles of laser, in the base_link frame.
     tf::Quaternion q;
     q.setRPY(0.0, 0.0, laser_scan->angle_min);
@@ -1177,7 +1183,7 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
     tf::Stamped<tf::Quaternion> inc_q(q, laser_scan->header.stamp,
                                       laser_scan->header.frame_id);
     try
-    {
+    { 
       tf_->transformQuaternion(base_frame_id_, min_q, min_q);
       tf_->transformQuaternion(base_frame_id_, inc_q, inc_q);
     }
@@ -1199,7 +1205,7 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
     // Apply range min/max thresholds, if the user supplied them
     if(laser_max_range_ > 0.0)
       ldata.range_max = std::min(laser_scan->range_max, (float)laser_max_range_);
-    else
+    else 
       ldata.range_max = laser_scan->range_max;
     double range_min;
     if(laser_min_range_ > 0.0)
@@ -1234,10 +1240,29 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
       pf_update_resample(pf_);
       resampled = true;
     }
-
+    
+    
     pf_sample_set_t* set = pf_->sets + pf_->current_set;
-    ROS_DEBUG("Num samples: %d\n", set->sample_count);
-
+    
+    //ROS_DEBUG("Num samples: %d\n", set->sample_count); // modified to see sample_count
+    std::cout << "Sum of weights "<<pf_->w_avg << std::endl; // modified to see sum of weights
+    pf_->w_avg=pf_->w_avg/set->sample_count; // edited for statistics
+    std::cout << "pf-fast "<<pf_->w_fast <<" pf-slow "<<pf_->w_slow <<" pf-avg "<<pf_->w_avg<<std::endl; // modified to see w_slow, w_fast, w_avg 
+    w_diff = 1-(pf_->w_fast / pf_->w_slow); // edited for statistics
+    std::cout << "w_diff "<<w_diff << std::endl; // modified to see w_diff
+    
+    //ros::Publisher probability_statistics;
+    geometry_msgs::Vector3 message_probability;
+    message_probability.x = pf_->w_slow;
+    message_probability.y = pf_->w_fast;
+    //message_probability.w_average = pf_->w_average;
+    message_probability.z = set->sample_count;
+    probability_statistics_.publish(message_probability);
+    geometry_msgs::Vector3 message_probability_1;
+    message_probability_1.x = w_diff;
+    message_probability_1.y = pf_->w_avg;
+    message_probability_1.z = 0;
+    probability_statistics_1_.publish(message_probability_1);
     // Publish the resulting cloud
     // TODO: set maximum rate for publishing
     if (!m_force_update) {

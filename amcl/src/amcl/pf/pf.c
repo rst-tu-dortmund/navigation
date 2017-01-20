@@ -270,7 +270,7 @@ void pf_update_sensor(pf_t *pf, pf_sensor_model_fn_t sensor_fn, void *sensor_dat
 
   set = pf->sets + pf->current_set;
 
-  // Compute the sample weights
+  // Compute the sample weightsw_avg 
   total = (*sensor_fn) (sensor_data, set);
   
   if (total > 0.0)
@@ -283,6 +283,7 @@ void pf_update_sensor(pf_t *pf, pf_sensor_model_fn_t sensor_fn, void *sensor_dat
       w_avg += sample->weight;
       sample->weight /= total;
     }
+    pf->w_avg=w_avg; // edited for statistics
     // Update running averages of likelihood of samples (Prob Rob p258)
     w_avg /= set->sample_count;
     if(pf->w_slow == 0.0)
@@ -343,7 +344,7 @@ void pf_update_resample(pf_t *pf)
   total = 0;
   set_b->sample_count = 0;
 
-  w_diff = 1.0 - pf->w_fast / pf->w_slow;
+  w_diff = 1.0 - pf->w_fast / pf->w_slow; //modified the division
   if(w_diff < 0.0)
     w_diff = 0.0;
   //printf("w_diff: %9.6f\n", w_diff);

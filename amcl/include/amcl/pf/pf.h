@@ -40,6 +40,7 @@ struct _pf_t;
 struct _rtk_fig_t;
 struct _pf_sample_set_t;
 
+
 // Function prototype for the initialization model; generates a sample pose from
 // an appropriate distribution.
 typedef pf_vector_t (*pf_init_model_fn_t) (void *init_data);
@@ -113,6 +114,7 @@ typedef struct _pf_t
   // This min and max number of samples
   int min_samples, max_samples;
 
+  double w_avg; // edited for statistics
   // Population size parameters
   double pop_err, pop_z;
   
