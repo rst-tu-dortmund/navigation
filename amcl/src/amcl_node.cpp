@@ -46,6 +46,7 @@
 #include "geometry_msgs/PoseWithCovarianceStamped.h"
 #include "geometry_msgs/PoseArray.h"
 #include "geometry_msgs/Pose.h"
+#include "geometry_msgs/Twist.h"                            //Added for dynamic radius
 #include "nav_msgs/GetMap.h"
 #include "nav_msgs/SetMap.h"
 #include "std_srvs/Empty.h"
@@ -60,15 +61,29 @@
 // Dynamic_reconfigure
 #include "dynamic_reconfigure/server.h"
 #include "amcl/AMCLConfig.h"
+//#include "costmap_2d/Costmap2DConfig.h"//Added for radius
 
 // Allows AMCL to run from bag file
 #include <rosbag/bag.h>
 #include <rosbag/view.h>
 #include <boost/foreach.hpp>
+#include <boost/circular_buffer.hpp>//added for buffer
+#include <algorithm> //added for maxelement
 
 #define NEW_UNIFORM_SAMPLING 1
 
 using namespace amcl;
+
+// edited for statistics to save the w_avg and the position
+struct statistic_buffer{ 
+    float w_avg;
+    float x;
+    float y;
+    geometry_msgs::Quaternion_<std::allocator<void> > z;
+};
+
+struct statistic_buffer buffer_input; // edited for statistics to save the w_avg and the position
+boost::circular_buffer<statistic_buffer> statistic_buffer_input(5); // edited for statistics to save the w_avg and the position
 
 // Pose hypothesis
 typedef struct
@@ -155,6 +170,7 @@ class AmclNode
     void initialPoseReceived(const geometry_msgs::PoseWithCovarianceStampedConstPtr& msg);
     void handleInitialPoseMessage(const geometry_msgs::PoseWithCovarianceStamped& msg);
     void mapReceived(const nav_msgs::OccupancyGridConstPtr& msg);
+    void velCallback(const geometry_msgs::TwistConstPtr& vel);                               //added for dynamic radius
 
     void handleMapMessage(const nav_msgs::OccupancyGrid& msg);
     void freeMapDependentMemory();
@@ -182,6 +198,7 @@ class AmclNode
     ros::Duration save_pose_period;
 
     geometry_msgs::PoseWithCovarianceStamped last_published_pose;
+    geometry_msgs::Twist new_vel;                                               //Added for Dynamic Radius
 
     map_t* map_;
     char* mapdata;
@@ -232,13 +249,17 @@ class AmclNode
     ros::NodeHandle nh_;
     ros::NodeHandle private_nh_;
     ros::Publisher pose_pub_;
+    ros::Publisher pose_pub_kidnapped_;
     ros::Publisher particlecloud_pub_;
+    ros::Publisher probability_statistics_;
+    ros::Publisher probability_statistics_1_;//added for publishing weights
     ros::ServiceServer global_loc_srv_;
     ros::ServiceServer nomotion_update_srv_; //to let amcl update samples without requiring motion
     ros::ServiceServer set_map_srv_;
     ros::Subscriber initial_pose_sub_old_;
     ros::Subscriber map_sub_;
-
+    ros::Subscriber current_vel_sub_;
+    
     amcl_hyp_t* initial_pose_hyp_;
     bool first_map_received_;
     bool first_reconfigure_call_;
@@ -247,7 +268,9 @@ class AmclNode
     dynamic_reconfigure::Server<amcl::AMCLConfig> *dsrv_;
     amcl::AMCLConfig default_config_;
     ros::Timer check_laser_timer_;
-
+    
+    double costmap_size_;                                                                   //Added for dynamic radius
+    double vel_max_;                                                                   //Added for dynamic radius
     int max_beams_, min_particles_, max_particles_;
     double alpha1_, alpha2_, alpha3_, alpha4_, alpha5_;
     double alpha_slow_, alpha_fast_;
@@ -336,6 +359,9 @@ AmclNode::AmclNode() :
   private_nh_.param("save_pose_rate", tmp, 0.5);
   save_pose_period = ros::Duration(1.0/tmp);
 
+  //costmap_size_=6.0;     //Added for Radius
+  vel_max_=0.5;         //Added for Radius
+  //private_nh_.getParam("local_costmap/width", costmap_size_);         //Added for Radius
   private_nh_.param("laser_min_range", laser_min_range_, -1.0);
   private_nh_.param("laser_max_range", laser_max_range_, -1.0);
   private_nh_.param("laser_max_beams", max_beams_, 30);
@@ -420,7 +446,10 @@ AmclNode::AmclNode() :
   tf_ = new TransformListenerWrapper();
 
   pose_pub_ = nh_.advertise<geometry_msgs::PoseWithCovarianceStamped>("amcl_pose", 2, true);
+  pose_pub_kidnapped_ = nh_.advertise<geometry_msgs::PoseWithCovarianceStamped>("initialpose", 2, true);
   particlecloud_pub_ = nh_.advertise<geometry_msgs::PoseArray>("particlecloud", 2, true);
+  probability_statistics_ = nh_.advertise<geometry_msgs::Vector3>("weights_pub", 2, true); //Added for Publishing weights info
+  probability_statistics_1_ = nh_.advertise<geometry_msgs::Vector3>("diff_pub", 2, true); //Added for Publishing weights info
   global_loc_srv_ = nh_.advertiseService("global_localization", 
 					 &AmclNode::globalLocalizationCallback,
                                          this);
@@ -436,7 +465,9 @@ AmclNode::AmclNode() :
   laser_scan_filter_->registerCallback(boost::bind(&AmclNode::laserReceived,
                                                    this, _1));
   initial_pose_sub_ = nh_.subscribe("initialpose", 2, &AmclNode::initialPoseReceived, this);
-
+  
+  current_vel_sub_ = nh_.subscribe("mobile_base/commands/velocity", 1, &AmclNode::velCallback, this);                                       //Added for dynamic radius
+  
   if(use_map_topic_) {
     map_sub_ = nh_.subscribe("map", 1, &AmclNode::mapReceived, this);
     ROS_INFO("Subscribed to map topic.");
@@ -524,6 +555,7 @@ void AmclNode::reconfigureCB(AMCLConfig &config, uint32_t level)
     config.max_particles = config.min_particles;
   }
 
+  //costmap_size_ = config.width;           //Added for Radius
   min_particles_ = config.min_particles;
   max_particles_ = config.max_particles;
   alpha_slow_ = config.recovery_alpha_slow;
@@ -990,7 +1022,10 @@ AmclNode::uniformPoseGenerator(void* arg)
     p.v[2] = drand48() * 2 * M_PI - M_PI;
     // Check that it's a free cell
     int i,j;
-    i = MAP_GXWX(map, p.v[0]);
+    i = MAP_GXWX(map, p.v[0]);if(pf_->w_avg<0.005)
+    {
+      pose_pub_kidnapped_.publish(last_published_pose);
+    }
     j = MAP_GYWY(map, p.v[1]);
     if(MAP_VALID(map,i,j) && (map->cells[MAP_INDEX(map,i,j)].occ_state == -1))
       break;
@@ -1038,6 +1073,7 @@ AmclNode::setMapCallback(nav_msgs::SetMap::Request& req,
 void
 AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
 {
+  float w_diff; //Edited for statistics
   last_laser_received_ts_ = ros::Time::now();
   if( map_ == NULL ) {
     return;
@@ -1059,7 +1095,7 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
     tf::Stamped<tf::Pose> laser_pose;
     try
     {
-      this->tf_->transformPose(base_frame_id_, ident, laser_pose);
+    this->tf_->transformPose(base_frame_id_, ident, laser_pose);
     }
     catch(tf::TransformException& e)
     {
@@ -1076,7 +1112,7 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
     // laser mounting angle gets computed later -> set to 0 here!
     laser_pose_v.v[2] = 0;
     lasers_[laser_index]->SetLaserPose(laser_pose_v);
-    ROS_DEBUG("Received laser's pose wrt robot: %.3f %.3f %.3f",
+    ROS_DEBUG("Received laser's pose wrt robot: %.3f %.3f %.3f", 
               laser_pose_v.v[0],
               laser_pose_v.v[1],
               laser_pose_v.v[2]);
@@ -1097,7 +1133,7 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
   }
 
 
-  pf_vector_t delta = pf_vector_zero();
+  pf_vector_t delta = pf_vector_zero(); 
 
   if(pf_init_)
   {
@@ -1106,6 +1142,8 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
     delta.v[0] = pose.v[0] - pf_odom_pose_.v[0];
     delta.v[1] = pose.v[1] - pf_odom_pose_.v[1];
     delta.v[2] = angle_diff(pose.v[2], pf_odom_pose_.v[2]);
+
+    
 
     // See if we should update the filter
     bool update = fabs(delta.v[0]) > d_thresh_ ||
@@ -1119,7 +1157,7 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
       for(unsigned int i=0; i < lasers_update_.size(); i++)
         lasers_update_[i] = true;
   }
-
+ 
   bool force_publication = false;
   if(!pf_init_)
   {
@@ -1140,7 +1178,7 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
   // If the robot has moved, update the filter
   else if(pf_init_ && lasers_update_[laser_index])
   {
-    //printf("pose\n");
+    //printf("pose\n"); 
     //pf_vector_fprintf(pose, stdout, "%.3f");
 
     AMCLOdomData odata;
@@ -1148,6 +1186,7 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
     // HACK
     // Modify the delta in the action data so the filter gets
     // updated correctly
+
     odata.delta = delta;
 
     // Use the action data to update the filter
@@ -1162,12 +1201,12 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
   if(lasers_update_[laser_index])
   {
     AMCLLaserData ldata;
-    ldata.sensor = lasers_[laser_index];
+    ldata.sensor = lasers_[laser_index]; 
     ldata.range_count = laser_scan->ranges.size();
 
     // To account for lasers that are mounted upside-down, we determine the
     // min, max, and increment angles of the laser in the base frame.
-    //
+    //    //message_probability.w_average = pf_->w_average;
     // Construct min and max angles of laser, in the base_link frame.
     tf::Quaternion q;
     q.setRPY(0.0, 0.0, laser_scan->angle_min);
@@ -1177,13 +1216,13 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
     tf::Stamped<tf::Quaternion> inc_q(q, laser_scan->header.stamp,
                                       laser_scan->header.frame_id);
     try
-    {
+    { 
       tf_->transformQuaternion(base_frame_id_, min_q, min_q);
       tf_->transformQuaternion(base_frame_id_, inc_q, inc_q);
     }
     catch(tf::TransformException& e)
     {
-      ROS_WARN("Unable to transform min/max laser angles into base frame: %s",
+      ROS_WARN("Unable to transform min/max laser a    //message_probability.w_average = pf_->w_average;ngles into base frame: %s",
                e.what());
       return;
     }
@@ -1199,7 +1238,7 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
     // Apply range min/max thresholds, if the user supplied them
     if(laser_max_range_ > 0.0)
       ldata.range_max = std::min(laser_scan->range_max, (float)laser_max_range_);
-    else
+    else 
       ldata.range_max = laser_scan->range_max;
     double range_min;
     if(laser_min_range_ > 0.0)
@@ -1234,10 +1273,70 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
       pf_update_resample(pf_);
       resampled = true;
     }
-
+    
+    
     pf_sample_set_t* set = pf_->sets + pf_->current_set;
-    ROS_DEBUG("Num samples: %d\n", set->sample_count);
-
+    
+    //ROS_DEBUG("Num samples: %d\n", set->sample_count); // modified to see sample_count
+    std::cout << "Sum of weights "<<pf_->w_avg << std::endl; // modified to see sum of weights
+    pf_->w_avg=pf_->w_avg/set->sample_count; // edited for statistics
+    std::cout << "pf-fast "<<pf_->w_fast <<" pf-slow "<<pf_->w_slow <<" pf-avg "<<pf_->w_avg<<std::endl; // modified to see w_slow, w_fast, w_avg 
+    w_diff = 1-(pf_->w_fast / pf_->w_slow); // edited for statistics
+    std::cout << "w_diff "<<w_diff << std::endl; // modified to see w_diff
+    
+    //ros::Publisher probability_statistics;
+    geometry_msgs::Vector3 message_probability;
+    message_probability.x = pf_->w_slow;
+    message_probability.y = pf_->w_fast;
+    //message_probability.w_average = pf_->w_average;
+    message_probability.z = set->sample_count;
+    probability_statistics_.publish(message_probability);
+    geometry_msgs::Vector3 message_probability_1;
+    message_probability_1.x = w_diff;
+    message_probability_1.y = pf_->w_avg;
+    message_probability_1.z = costmap_size_;
+    probability_statistics_1_.publish(message_probability_1);
+        
+    std::cout << "current vel: "<<new_vel.linear.x << std::endl; // modified to see w_diff
+    std::cout << "costmap size: "<<costmap_size_ << std::endl; // modified to see w_diff
+    
+    if(pf_->w_avg < pf_->w_slow)
+    //if(pf_->w_slow>=0.006 && w_diff>-0.3)
+    //if(pf_->w_slow<=0.00005 && pf_->w_fast<=0.00005)
+    {   
+        
+        float w_avg_new[size(statistic_buffer_input)];
+        float w_avg_max;
+        int index_w_avg_max;
+        
+        for (int i=0; i<size(statistic_buffer_input);i++) {
+            
+            statistic_buffer first = statistic_buffer_input[i];
+            w_avg_new[i] = first.w_avg; 
+        }
+        int a = size(statistic_buffer_input);
+        w_avg_max = *std::max_element(w_avg_new,w_avg_new+a);
+        for (int i=0; i<size(statistic_buffer_input);i++)
+        {
+            if (statistic_buffer_input[i].w_avg==w_avg_max)
+            {
+                index_w_avg_max = i;
+            }
+        } 
+        
+//         last_published_pose.pose.pose.position.x = statistic_buffer_input[index_w_avg_max].x;
+//         last_published_pose.pose.pose.position.y = statistic_buffer_input[index_w_avg_max].y;
+//         last_published_pose.pose.pose.orientation = statistic_buffer_input[index_w_avg_max].z;
+      //tf::quaternionTFToMsg(tf::createQuaternionFromY                                                          aw(hyps[max_weight_hyp].pf_pose_mean.v[2]),
+        //                    p.pose.pose.orientation);
+        last_published_pose.pose.covariance[0]=new_vel.linear.x/vel_max_;//0.25;0.276680363034203;//init_cov_[0];
+        //last_published_pose.pose.covariance[1]=0.0;//0.020077052013546953;
+        //last_published_pose.pose.covariance[6]=0.0;//0.020077052013546953;
+        last_published_pose.pose.covariance[7]=new_vel.linear.x/vel_max_;//0.25;0.29182139712414323;//init_cov_[1];
+        last_published_pose.pose.covariance[35]=init_cov_[2];//0.10168796227736157;
+     
+        pose_pub_kidnapped_.publish(last_published_pose);
+    }
     // Publish the resulting cloud
     // TODO: set maximum rate for publishing
     if (!m_force_update) {
@@ -1315,7 +1414,7 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
         for(int j=0; j<2; j++)
         {
           // Report the overall filter covariance, rather than the
-          // covariance for the highest-weight cluster
+          // covariance for        struct statistic_buffer buffer_input;the highest-weight cluster
           //p.covariance[6*i+j] = hyps[max_weight_hyp].pf_pose_cov.m[i][j];
           p.pose.covariance[6*i+j] = set->cov.m[i][j];
         }
@@ -1326,7 +1425,7 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
       p.pose.covariance[6*5+5] = set->cov.m[2][2];
 
       /*
-         printf("cov:\n");
+         printf("cov:\n");i
          for(int i=0; i<6; i++)
          {
          for(int j=0; j<6; j++)
@@ -1342,6 +1441,24 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
                hyps[max_weight_hyp].pf_pose_mean.v[0],
                hyps[max_weight_hyp].pf_pose_mean.v[1],
                hyps[max_weight_hyp].pf_pose_mean.v[2]);
+      
+      
+      // edit for statistics, buffering the datas
+        
+        //struct statistic_buffer buffer_input;
+        buffer_input.w_avg = pf_->w_avg;
+        buffer_input.x = p.pose.pose.position.x;
+        buffer_input.y = p.pose.pose.position.y;
+        buffer_input.z = p.pose.pose.orientation;
+        //boost::circular_buffer<statistic_buffer> statistic_buffer_input(5);
+        statistic_buffer_input.push_back(buffer_input);
+        
+        for (int i=0; i<size(statistic_buffer_input);i++) {
+            
+        statistic_buffer first = statistic_buffer_input[i];
+        std::cout << "first_wavg "<<first.w_avg<<" first_x"<<first.x <<" first_y "<<first.y<<std::endl; 
+        }
+      
 
       // subtracting base to odom from map to base and send map to odom instead
       tf::Stamped<tf::Pose> odom_to_map;
@@ -1519,4 +1636,10 @@ AmclNode::applyInitialPose()
     delete initial_pose_hyp_;
     initial_pose_hyp_ = NULL;
   }
+}
+
+void
+AmclNode::velCallback(const geometry_msgs::TwistConstPtr& vel)
+{
+    new_vel = *vel; 
 }
