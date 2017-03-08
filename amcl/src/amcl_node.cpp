@@ -46,7 +46,7 @@
 #include "geometry_msgs/PoseWithCovarianceStamped.h"
 #include "geometry_msgs/PoseArray.h"
 #include "geometry_msgs/Pose.h"
-#include "geometry_msgs/Twist.h"                            //Added for dynamic radius
+#include "geometry_msgs/Twist.h"                       //Added for dynamic radius
 #include "nav_msgs/GetMap.h"
 #include "nav_msgs/SetMap.h"
 #include "std_srvs/Empty.h"
@@ -1329,10 +1329,10 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
 //         last_published_pose.pose.pose.orientation = statistic_buffer_input[index_w_avg_max].z;
       //tf::quaternionTFToMsg(tf::createQuaternionFromY                                                          aw(hyps[max_weight_hyp].pf_pose_mean.v[2]),
         //                    p.pose.pose.orientation);
-        last_published_pose.pose.covariance[0]=new_vel.linear.x/vel_max_;//0.25;0.276680363034203;//init_cov_[0];
-        //last_published_pose.pose.covariance[1]=0.0;//0.020077052013546953;
-        //last_published_pose.pose.covariance[6]=0.0;//0.020077052013546953;
-        last_published_pose.pose.covariance[7]=new_vel.linear.x/vel_max_;//0.25;0.29182139712414323;//init_cov_[1];
+        last_published_pose.pose.covariance[0]=init_cov_[0];//new_vel.linear.x/vel_max_;//0.25;0.276680363034203;//init_cov_[0];
+        last_published_pose.pose.covariance[1]=0.0;//0.020077052013546953;
+        last_published_pose.pose.covariance[6]=0.0;//0.020077052013546953;
+        last_published_pose.pose.covariance[7]=init_cov_[1];//new_vel.linear.x/vel_max_;//0.25;0.29182139712414323;//init_cov_[1];
         last_published_pose.pose.covariance[35]=init_cov_[2];//0.10168796227736157;
      
         pose_pub_kidnapped_.publish(last_published_pose);
