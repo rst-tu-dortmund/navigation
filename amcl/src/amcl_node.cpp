@@ -46,7 +46,7 @@
 #include "geometry_msgs/PoseWithCovarianceStamped.h"
 #include "geometry_msgs/PoseArray.h"
 #include "geometry_msgs/Pose.h"
-#include "geometry_msgs/Twist.h"                       //Added for dynamic radius
+#include "geometry_msgs/Twist.h"       			//TU-Project. Added for receiving velocity message needed for the dynamic radius
 #include "nav_msgs/GetMap.h"
 #include "nav_msgs/SetMap.h"
 #include "std_srvs/Empty.h"
@@ -61,29 +61,18 @@
 // Dynamic_reconfigure
 #include "dynamic_reconfigure/server.h"
 #include "amcl/AMCLConfig.h"
-//#include "costmap_2d/Costmap2DConfig.h"//Added for radius
 
 // Allows AMCL to run from bag file
 #include <rosbag/bag.h>
 #include <rosbag/view.h>
 #include <boost/foreach.hpp>
-#include <boost/circular_buffer.hpp>//added for buffer
-#include <algorithm> //added for maxelement
+#include <boost/circular_buffer.hpp>			//TU-Project. Added for the creation of a circular buffer of last n known positions
+#include <algorithm> 					//TU-Project. Added to use function maxelement on the circular buffer
+#include <iterator>					//TU-Project. Added to use function distance on the circular buffer
 
 #define NEW_UNIFORM_SAMPLING 1
 
 using namespace amcl;
-
-// edited for statistics to save the w_avg and the position
-struct statistic_buffer{ 
-    float w_avg;
-    float x;
-    float y;
-    geometry_msgs::Quaternion_<std::allocator<void> > z;
-};
-
-struct statistic_buffer buffer_input; // edited for statistics to save the w_avg and the position
-boost::circular_buffer<statistic_buffer> statistic_buffer_input(5); // edited for statistics to save the w_avg and the position
 
 // Pose hypothesis
 typedef struct
@@ -98,6 +87,18 @@ typedef struct
   pf_matrix_t pf_pose_cov;
 
 } amcl_hyp_t;
+
+struct statistic_buffer						//TU-Project. Structure defined to save relevant information in the circular buffer
+{
+  double w_avg;							//TU-Project. Average weight for the current position
+  double x;							//TU-Project. Current position x
+  double y;							//TU-Project. Current position y
+  geometry_msgs::Quaternion z;					//TU-Project. Current orientation z
+};
+
+struct statistic_buffer buffer_input; 					//TU-Project. Structure allocated for saving pose information into the circular buffer
+boost::circular_buffer<statistic_buffer> statistic_buffer_input(5);	//TU-Project. Creating a circular buffer to save the last n know pose information
+//statistic_buffer_input.set_capacity(5);				//TU-Project. Creating a circular buffer of 5 positions to save the last 5 know pose information
 
 static double
 normalize(double z)
@@ -170,7 +171,7 @@ class AmclNode
     void initialPoseReceived(const geometry_msgs::PoseWithCovarianceStampedConstPtr& msg);
     void handleInitialPoseMessage(const geometry_msgs::PoseWithCovarianceStamped& msg);
     void mapReceived(const nav_msgs::OccupancyGridConstPtr& msg);
-    void velCallback(const geometry_msgs::TwistConstPtr& vel);                               //added for dynamic radius
+    void velCallback(const geometry_msgs::TwistConstPtr& vel);				//TU-Project. Callback for the velocity message used for the dynamic radius
 
     void handleMapMessage(const nav_msgs::OccupancyGrid& msg);
     void freeMapDependentMemory();
@@ -198,7 +199,9 @@ class AmclNode
     ros::Duration save_pose_period;
 
     geometry_msgs::PoseWithCovarianceStamped last_published_pose;
-    geometry_msgs::Twist new_vel;                                               //Added for Dynamic Radius
+    geometry_msgs::Twist new_vel;					//TU-Project. Added for receiving velocity message needed for the dynamic radius
+    geometry_msgs::Vector3 message_probability;				//TU-Project. Added for sending robot pose probability information
+    geometry_msgs::Vector3 message_probability_1;			//TU-Project. Added for sending aditional robot pose probability information
 
     map_t* map_;
     char* mapdata;
@@ -249,16 +252,16 @@ class AmclNode
     ros::NodeHandle nh_;
     ros::NodeHandle private_nh_;
     ros::Publisher pose_pub_;
-    ros::Publisher pose_pub_kidnapped_;
+    ros::Publisher pose_kidnapped_pub_;		//TU-Project. Publisher used to re-initialize particle filter with at initial pose message
+    ros::Publisher probability_statistics_pub_;	//TU-Project. Publisher used to send statistic information on robot poses
+    ros::Publisher probability_statistics_1_pub_;	//TU-Project. Publisher used to send additional statistic information on robot poses
     ros::Publisher particlecloud_pub_;
-    ros::Publisher probability_statistics_;
-    ros::Publisher probability_statistics_1_;//added for publishing weights
     ros::ServiceServer global_loc_srv_;
     ros::ServiceServer nomotion_update_srv_; //to let amcl update samples without requiring motion
     ros::ServiceServer set_map_srv_;
     ros::Subscriber initial_pose_sub_old_;
     ros::Subscriber map_sub_;
-    ros::Subscriber current_vel_sub_;
+    ros::Subscriber current_vel_sub_;		//TU-Project. Subcriber to get the current velocity of the robot
     
     amcl_hyp_t* initial_pose_hyp_;
     bool first_map_received_;
@@ -269,8 +272,12 @@ class AmclNode
     amcl::AMCLConfig default_config_;
     ros::Timer check_laser_timer_;
     
-    double costmap_size_;                                                                   //Added for dynamic radius
-    double vel_max_;                                                                   //Added for dynamic radius
+    double dyn_rad_;                          				//TU-Project. Dynamic radius variable
+    double max_rad_;                          				//TU-Project. Maximum radius allowed for spreading particles for local recovery
+    double min_rad_;                          				//TU-Project. Minimum radius allowed for spreading particles for local recovery
+    double max_vel_;                          				//TU-Project. Variable to store the maximum velocity of the robot from the parameter server
+    double w_diff_; 							//TU-Project. Variable used in the detection of a kidnapped problem or lost of position
+    
     int max_beams_, min_particles_, max_particles_;
     double alpha1_, alpha2_, alpha3_, alpha4_, alpha5_;
     double alpha_slow_, alpha_fast_;
@@ -359,9 +366,6 @@ AmclNode::AmclNode() :
   private_nh_.param("save_pose_rate", tmp, 0.5);
   save_pose_period = ros::Duration(1.0/tmp);
 
-  //costmap_size_=6.0;     //Added for Radius
-  vel_max_=0.5;         //Added for Radius
-  //private_nh_.getParam("local_costmap/width", costmap_size_);         //Added for Radius
   private_nh_.param("laser_min_range", laser_min_range_, -1.0);
   private_nh_.param("laser_max_range", laser_max_range_, -1.0);
   private_nh_.param("laser_max_beams", max_beams_, 30);
@@ -446,10 +450,10 @@ AmclNode::AmclNode() :
   tf_ = new TransformListenerWrapper();
 
   pose_pub_ = nh_.advertise<geometry_msgs::PoseWithCovarianceStamped>("amcl_pose", 2, true);
-  pose_pub_kidnapped_ = nh_.advertise<geometry_msgs::PoseWithCovarianceStamped>("initialpose", 2, true);
   particlecloud_pub_ = nh_.advertise<geometry_msgs::PoseArray>("particlecloud", 2, true);
-  probability_statistics_ = nh_.advertise<geometry_msgs::Vector3>("weights_pub", 2, true); //Added for Publishing weights info
-  probability_statistics_1_ = nh_.advertise<geometry_msgs::Vector3>("diff_pub", 2, true); //Added for Publishing weights info
+  pose_kidnapped_pub_ = nh_.advertise<geometry_msgs::PoseWithCovarianceStamped>("initialpose", 2, true);	//TU-Project. Publisher to re-initialize particle filter
+  probability_statistics_pub_ = nh_.advertise<geometry_msgs::Vector3>("weights_pub", 2, true); 			//TU-Project. Publisher for pose statistics
+  probability_statistics_1_pub_ = nh_.advertise<geometry_msgs::Vector3>("diff_pub", 2, true); 			//TU-Project. Publisher for additional pose statictics
   global_loc_srv_ = nh_.advertiseService("global_localization", 
 					 &AmclNode::globalLocalizationCallback,
                                          this);
@@ -465,8 +469,8 @@ AmclNode::AmclNode() :
   laser_scan_filter_->registerCallback(boost::bind(&AmclNode::laserReceived,
                                                    this, _1));
   initial_pose_sub_ = nh_.subscribe("initialpose", 2, &AmclNode::initialPoseReceived, this);
-  
-  current_vel_sub_ = nh_.subscribe("mobile_base/commands/velocity", 1, &AmclNode::velCallback, this);                                       //Added for dynamic radius
+  //current_vel_sub_ = nh_.subscribe("mobile_base/commands/velocity", 2, &AmclNode::velCallback, this);		//TU-Project. Subscriber for current velocity. Real Robot.
+  current_vel_sub_ = nh_.subscribe("cmd_vel", 2, &AmclNode::velCallback, this);				//TU-Project. Subscriber for current velocity. Simulation.
   
   if(use_map_topic_) {
     map_sub_ = nh_.subscribe("map", 1, &AmclNode::mapReceived, this);
@@ -484,6 +488,10 @@ AmclNode::AmclNode() :
   laser_check_interval_ = ros::Duration(15.0);
   check_laser_timer_ = nh_.createTimer(laser_check_interval_, 
                                        boost::bind(&AmclNode::checkLaserReceived, this, _1));
+  
+  private_nh_.getParam("/robot_1/move_base/TebLocalPlannerROS/max_vel_x",max_vel_);	//TU-Project. Getting the maximum velocity parameter from parameter server  
+  max_rad_=2.0;						//TU-Project. Maximum radius allowed for spreading particles for local recovery
+  min_rad_=0.5;						//TU-Project. Minimum radius allowed for spreading particles for local recovery
 }
 
 void AmclNode::reconfigureCB(AMCLConfig &config, uint32_t level)
@@ -555,7 +563,6 @@ void AmclNode::reconfigureCB(AMCLConfig &config, uint32_t level)
     config.max_particles = config.min_particles;
   }
 
-  //costmap_size_ = config.width;           //Added for Radius
   min_particles_ = config.min_particles;
   max_particles_ = config.max_particles;
   alpha_slow_ = config.recovery_alpha_slow;
@@ -1022,10 +1029,7 @@ AmclNode::uniformPoseGenerator(void* arg)
     p.v[2] = drand48() * 2 * M_PI - M_PI;
     // Check that it's a free cell
     int i,j;
-    i = MAP_GXWX(map, p.v[0]);if(pf_->w_avg<0.005)
-    {
-      pose_pub_kidnapped_.publish(last_published_pose);
-    }
+    i = MAP_GXWX(map, p.v[0]);
     j = MAP_GYWY(map, p.v[1]);
     if(MAP_VALID(map,i,j) && (map->cells[MAP_INDEX(map,i,j)].occ_state == -1))
       break;
@@ -1073,7 +1077,6 @@ AmclNode::setMapCallback(nav_msgs::SetMap::Request& req,
 void
 AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
 {
-  float w_diff; //Edited for statistics
   last_laser_received_ts_ = ros::Time::now();
   if( map_ == NULL ) {
     return;
@@ -1095,7 +1098,7 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
     tf::Stamped<tf::Pose> laser_pose;
     try
     {
-    this->tf_->transformPose(base_frame_id_, ident, laser_pose);
+      this->tf_->transformPose(base_frame_id_, ident, laser_pose);
     }
     catch(tf::TransformException& e)
     {
@@ -1143,8 +1146,6 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
     delta.v[1] = pose.v[1] - pf_odom_pose_.v[1];
     delta.v[2] = angle_diff(pose.v[2], pf_odom_pose_.v[2]);
 
-    
-
     // See if we should update the filter
     bool update = fabs(delta.v[0]) > d_thresh_ ||
                   fabs(delta.v[1]) > d_thresh_ ||
@@ -1186,7 +1187,6 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
     // HACK
     // Modify the delta in the action data so the filter gets
     // updated correctly
-
     odata.delta = delta;
 
     // Use the action data to update the filter
@@ -1206,7 +1206,7 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
 
     // To account for lasers that are mounted upside-down, we determine the
     // min, max, and increment angles of the laser in the base frame.
-    //    //message_probability.w_average = pf_->w_average;
+    // 
     // Construct min and max angles of laser, in the base_link frame.
     tf::Quaternion q;
     q.setRPY(0.0, 0.0, laser_scan->angle_min);
@@ -1222,7 +1222,7 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
     }
     catch(tf::TransformException& e)
     {
-      ROS_WARN("Unable to transform min/max laser a    //message_probability.w_average = pf_->w_average;ngles into base frame: %s",
+      ROS_WARN("Unable to transform min/max laser angles into base frame: %s",
                e.what());
       return;
     }
@@ -1273,70 +1273,70 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
       pf_update_resample(pf_);
       resampled = true;
     }
-    
-    
+       
     pf_sample_set_t* set = pf_->sets + pf_->current_set;
+    ROS_DEBUG("Num samples: %d\n", set->sample_count);
     
-    //ROS_DEBUG("Num samples: %d\n", set->sample_count); // modified to see sample_count
-    std::cout << "Sum of weights "<<pf_->w_avg << std::endl; // modified to see sum of weights
-    pf_->w_avg=pf_->w_avg/set->sample_count; // edited for statistics
-    std::cout << "pf-fast "<<pf_->w_fast <<" pf-slow "<<pf_->w_slow <<" pf-avg "<<pf_->w_avg<<std::endl; // modified to see w_slow, w_fast, w_avg 
-    w_diff = 1-(pf_->w_fast / pf_->w_slow); // edited for statistics
-    std::cout << "w_diff "<<w_diff << std::endl; // modified to see w_diff
+    std::cout << "Sum of weights "<<pf_->w_avg << std::endl;		//TU-Project. Debug purposes. Sum of weights from particle filter
+    pf_->w_avg=pf_->w_avg/set->sample_count; 				//TU-Project. Debug purposes. Calculating the weight average
+    std::cout << "pf-fast "<<pf_->w_fast <<" pf-slow "<<pf_->w_slow <<" pf-avg "<<pf_->w_avg<<std::endl;	//TU-Project. Debug purposes
+    w_diff_ = 1-(pf_->w_fast / pf_->w_slow);				//TU-Project. Debug purposes. Calculating kidnapped detection variable
+    std::cout << "w_diff "<<w_diff_ << std::endl; 			//TU-Project. Debug purposes
     
-    //ros::Publisher probability_statistics;
-    geometry_msgs::Vector3 message_probability;
-    message_probability.x = pf_->w_slow;
-    message_probability.y = pf_->w_fast;
-    //message_probability.w_average = pf_->w_average;
-    message_probability.z = set->sample_count;
-    probability_statistics_.publish(message_probability);
-    geometry_msgs::Vector3 message_probability_1;
-    message_probability_1.x = w_diff;
-    message_probability_1.y = pf_->w_avg;
-    message_probability_1.z = costmap_size_;
-    probability_statistics_1_.publish(message_probability_1);
-        
-    std::cout << "current vel: "<<new_vel.linear.x << std::endl; // modified to see w_diff
-    std::cout << "costmap size: "<<costmap_size_ << std::endl; // modified to see w_diff
+    if((fabs(new_vel.linear.x))<0.1)			
+      dyn_rad_=max_rad_;							//TU-Project. If the robot has a small velocity, apply maximum radius
+    else
+      dyn_rad_=min_rad_+(max_rad_-min_rad_)*(fabs(new_vel.linear.x)/max_vel_);	//TU-Project. Calculating the dynamic radius according to the current speed
     
-    if(pf_->w_avg < pf_->w_slow)
-    //if(pf_->w_slow>=0.006 && w_diff>-0.3)
-    //if(pf_->w_slow<=0.00005 && pf_->w_fast<=0.00005)
-    {   
+    message_probability.x = pf_->w_slow;				//TU-Project. Long term average from the particle filter weights
+    message_probability.y = pf_->w_fast;				//TU-Project. Short term average from the particle filter weights
+    message_probability.z = set->sample_count;				//TU-Project. Number of particles used in the particle filter
+    probability_statistics_pub_.publish(message_probability);		//TU-Project. Publishing information for recovery purposes
+    
+    message_probability_1.x = w_diff_;					//TU-Project. kidnapped detection variable
+    message_probability_1.y = pf_->w_avg;				//TU-Project. Weight average
+    message_probability_1.z = dyn_rad_;					//TU-Project. Dynamic radius for spreading particles
+    probability_statistics_1_pub_.publish(message_probability_1);	//TU-Project. Publishing information for recovery purposes
         
-        float w_avg_new[size(statistic_buffer_input)];
-        float w_avg_max;
-        int index_w_avg_max;
-        
-        for (int i=0; i<size(statistic_buffer_input);i++) {
-            
-            statistic_buffer first = statistic_buffer_input[i];
-            w_avg_new[i] = first.w_avg; 
-        }
-        int a = size(statistic_buffer_input);
-        w_avg_max = *std::max_element(w_avg_new,w_avg_new+a);
-        for (int i=0; i<size(statistic_buffer_input);i++)
-        {
-            if (statistic_buffer_input[i].w_avg==w_avg_max)
-            {
-                index_w_avg_max = i;
-            }
-        } 
-        
-//         last_published_pose.pose.pose.position.x = statistic_buffer_input[index_w_avg_max].x;
-//         last_published_pose.pose.pose.position.y = statistic_buffer_input[index_w_avg_max].y;
-//         last_published_pose.pose.pose.orientation = statistic_buffer_input[index_w_avg_max].z;
-      //tf::quaternionTFToMsg(tf::createQuaternionFromY                                                          aw(hyps[max_weight_hyp].pf_pose_mean.v[2]),
-        //                    p.pose.pose.orientation);
-        last_published_pose.pose.covariance[0]=init_cov_[0];//new_vel.linear.x/vel_max_;//0.25;0.276680363034203;//init_cov_[0];
-        last_published_pose.pose.covariance[1]=0.0;//0.020077052013546953;
-        last_published_pose.pose.covariance[6]=0.0;//0.020077052013546953;
-        last_published_pose.pose.covariance[7]=init_cov_[1];//new_vel.linear.x/vel_max_;//0.25;0.29182139712414323;//init_cov_[1];
-        last_published_pose.pose.covariance[35]=init_cov_[2];//0.10168796227736157;
-     
-        pose_pub_kidnapped_.publish(last_published_pose);
+    std::cout << "max vel: "<<max_vel_ << std::endl;			//TU-Project. Debug purposes. Maximum velocity from parameter server
+    std::cout << "current vel: "<<new_vel.linear.x << std::endl;	//TU-Project. Debug purposes. Current robot velocity
+    std::cout << "radius size: "<<dyn_rad_ << std::endl;		//TU-Project. Debug purposes. Dynamic radius
+    
+    buffer_input.w_avg = pf_->w_avg;					//TU-Project. Saving last known pose information to structure buffer_input
+    buffer_input.x = last_published_pose.pose.pose.position.x;		//TU-Project. Saving last known pose information to structure buffer_input
+    buffer_input.y = last_published_pose.pose.pose.position.y;		//TU-Project. Saving last known pose information to structure buffer_input
+    buffer_input.z = last_published_pose.pose.pose.orientation;		//TU-Project. Saving last known pose information to structure buffer_input
+    
+    statistic_buffer_input.push_back(buffer_input);			//TU-Project. Pushing structure to circular buffer
+    
+    for (int i=0; i<size(statistic_buffer_input);i++)			//TU-Project. Debug purposes. Printing circular buffer elements
+    {
+      std::cout << "wavg "<<statistic_buffer_input[i].w_avg<<" x "<<statistic_buffer_input[i].x <<" y "<<statistic_buffer_input[i].y<<std::endl; 
     }
+    
+    if(pf_->w_avg < pf_->w_slow)					//TU-Project. Current condition for starting a recovery behaviour 
+    {   
+      double w_avg_new[size(statistic_buffer_input)];			//TU-Project. Creating vector to extract weight averages from the circular buffer
+      int index_w_avg_max;						//TU-Project. Variable to retrieve the index of the maximum weight average 
+      int size_buff = size(statistic_buffer_input);			//TU-Project. Circular buffer size 
+      
+      for (int i=0; i<size(statistic_buffer_input);i++)			//TU-Project. Extracting weight averages from the circular buffer 
+      {    
+	  w_avg_new[i] = statistic_buffer_input[i].w_avg;
+      }
+      index_w_avg_max = std::distance(w_avg_new,std::max_element(w_avg_new,w_avg_new+size_buff));	//TU-Project. Finding maximum weight average index on circular buffer
+      std::cout << "wavg "<<statistic_buffer_input[index_w_avg_max].w_avg;				//TU-Project. Debug purposes. Printing maximum buffer element
+      std::cout <<" x "<<statistic_buffer_input[index_w_avg_max].x;					//TU-Project. Debug purposes. Printing maximum buffer element
+      std::cout <<" y "<<statistic_buffer_input[index_w_avg_max].y<<std::endl;				//TU-Project. Debug purposes. Printing maximum buffer element
+      
+      last_published_pose.pose.covariance[0]=dyn_rad_*dyn_rad_/9;	//TU-Project. Modifying covariance matrix to spread particles according to the dynamic radius
+      last_published_pose.pose.covariance[1]=0.0;
+      last_published_pose.pose.covariance[6]=0.0;
+      last_published_pose.pose.covariance[7]=dyn_rad_*dyn_rad_/9;
+    
+      pose_kidnapped_pub_.publish(last_published_pose);			//TU-Project. Publishing the modified pose in order to re-initialize the particle filter around it
+    }
+    
     // Publish the resulting cloud
     // TODO: set maximum rate for publishing
     if (!m_force_update) {
@@ -1414,7 +1414,7 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
         for(int j=0; j<2; j++)
         {
           // Report the overall filter covariance, rather than the
-          // covariance for        struct statistic_buffer buffer_input;the highest-weight cluster
+          // covariance for the highest-weight cluster
           //p.covariance[6*i+j] = hyps[max_weight_hyp].pf_pose_cov.m[i][j];
           p.pose.covariance[6*i+j] = set->cov.m[i][j];
         }
@@ -1440,25 +1440,7 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
       ROS_DEBUG("New pose: %6.3f %6.3f %6.3f",
                hyps[max_weight_hyp].pf_pose_mean.v[0],
                hyps[max_weight_hyp].pf_pose_mean.v[1],
-               hyps[max_weight_hyp].pf_pose_mean.v[2]);
-      
-      
-      // edit for statistics, buffering the datas
-        
-        //struct statistic_buffer buffer_input;
-        buffer_input.w_avg = pf_->w_avg;
-        buffer_input.x = p.pose.pose.position.x;
-        buffer_input.y = p.pose.pose.position.y;
-        buffer_input.z = p.pose.pose.orientation;
-        //boost::circular_buffer<statistic_buffer> statistic_buffer_input(5);
-        statistic_buffer_input.push_back(buffer_input);
-        
-        for (int i=0; i<size(statistic_buffer_input);i++) {
-            
-        statistic_buffer first = statistic_buffer_input[i];
-        std::cout << "first_wavg "<<first.w_avg<<" first_x"<<first.x <<" first_y "<<first.y<<std::endl; 
-        }
-      
+               hyps[max_weight_hyp].pf_pose_mean.v[2]);      
 
       // subtracting base to odom from map to base and send map to odom instead
       tf::Stamped<tf::Pose> odom_to_map;
@@ -1639,7 +1621,7 @@ AmclNode::applyInitialPose()
 }
 
 void
-AmclNode::velCallback(const geometry_msgs::TwistConstPtr& vel)
+AmclNode::velCallback(const geometry_msgs::TwistConstPtr& vel)			//TU-Project. Velocity callback function to retrieve current velocity message
 {
     new_vel = *vel; 
 }
